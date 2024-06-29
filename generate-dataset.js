@@ -42,45 +42,25 @@ async function clearExistingData(db) {
     fs.rmSync(catalogUpdateFile);
   }
 }
-function arrayToStream(array, chunkSize) {
-  let index = 0;
 
-  return new Readable({
-    objectMode: true,
-    read() {
-      if (index < array.length) {
-        const chunk = array.slice(index, index + chunkSize);
-        index += chunkSize;
-        this.push(chunk);
-      } else {
-        this.push(null); // Signal end of stream
-      }
-    }
-  });
-}
 async function generateDataset(db, catalogSize) {
   writeCsvHeaders();
 
   const metrics = Metrics.zero();
   const createdAt = new Date();
-  const allProducts = Array.from({ length: catalogSize }, (_, i) => generateProduct(i, createdAt));
-  const stream = arrayToStream(allProducts, catalogSize / 10);
-  // console.log(splitArray(allProducts));
-  let index = 0;
-  for await (const products of stream) {
-    await Promise.all(products.map(async (product, i) => {
-      await db.collection('Products').insertOne(product);
-      // insert in updated dataset (csv) with a tweak
-      const updatedProduct = generateUpdate(product, i, catalogSize);
-      metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
-      index++;
-    }));
+  const products = Array.from({ length: catalogSize }, (_, i) => generateProduct(i, createdAt));
+
+  await db.collection('Products').insertMany(products);
+  products.map(async (product, index) => {
+    // insert in updated dataset (csv) with a tweak
+    const updatedProduct = generateUpdate(product, index, catalogSize);
+    metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
+
     const progressPercentage = index * 100 / catalogSize;
     if ((progressPercentage) % 10 === 0) {
       console.debug(`[DEBUG] Processing ${progressPercentage}%...`);
     }
-  }
-  console.log('done');
+  });
   logMetrics(catalogSize, metrics);
 }
 
