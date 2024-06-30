@@ -50,18 +50,34 @@ async function generateDataset(db, catalogSize) {
   const createdAt = new Date();
   const products = Array.from({ length: catalogSize }, (_, i) => generateProduct(i, createdAt));
 
-  await db.collection('Products').insertMany(products);
-  products.map(async (product, index) => {
-    // insert in updated dataset (csv) with a tweak
-    const updatedProduct = generateUpdate(product, index, catalogSize);
-    metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
+  await memory(
+    'Insert products',
+    () => timing(
+      'Insert products',
+      async () => await db.collection('Products').insertMany(products)));
 
-    const progressPercentage = index * 100 / catalogSize;
-    if ((progressPercentage) % 10 === 0) {
-      console.debug(`[DEBUG] Processing ${progressPercentage}%...`);
-    }
-  });
+  await memory(
+    'update products',
+    () => timing(
+      'update products',
+      () => {
+
+        products.map((product, index) => {
+          // insert in updated dataset (csv) with a tweak
+          const updatedProduct = generateUpdate(product, index, catalogSize);
+          metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
+
+          logProgress(index, catalogSize);
+        });
+      }));
   logMetrics(catalogSize, metrics);
+}
+
+function logProgress(numerator, denominator) {
+  const progressIndicator = numerator * 100 / denominator;
+  if (progressIndicator % 10 === 0) {
+    console.debug(`[DEBUG] Processing ${progressIndicator}%...`);
+  }
 }
 
 function writeCsvHeaders() {
