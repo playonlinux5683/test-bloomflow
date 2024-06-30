@@ -8,6 +8,7 @@ const { memory } = require('./helpers/memory');
 const { Metrics } = require('./helpers/metrics');
 const { Product } = require('./product');
 const { Readable } = require('stream');
+
 const DATABASE_NAME = 'test-product-catalog';
 const MONGO_URL = `mongodb://localhost:27017/${DATABASE_NAME}`;
 const catalogUpdateFile = 'updated-catalog.csv';
@@ -48,29 +49,45 @@ async function generateDataset(db, catalogSize) {
 
   const metrics = Metrics.zero();
   const createdAt = new Date();
-  const products = Array.from({ length: catalogSize }, (_, i) => generateProduct(i, createdAt));
 
-  await memory(
-    'Insert products',
-    () => timing(
-      'Insert products',
-      async () => await db.collection('Products').insertMany(products)));
+  const productStream = new ProductStream(catalogSize, createdAt);
+  let index = 0;
+  for await (const products of productStream) {
 
-  await memory(
-    'update products',
-    () => timing(
-      'update products',
-      () => {
+    await db.collection('Products').insertMany(products);
 
-        products.map((product, index) => {
-          // insert in updated dataset (csv) with a tweak
-          const updatedProduct = generateUpdate(product, index, catalogSize);
-          metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
+    for (const product of products) {
+      const updatedProduct = generateUpdate(product, index, catalogSize);
+      metrics.merge(writeProductUpdateToCsv(product, updatedProduct));
+      logProgress(index, catalogSize);
+      index++;
+    }
+  }
 
-          logProgress(index, catalogSize);
-        });
-      }));
   logMetrics(catalogSize, metrics);
+}
+
+class ProductStream extends Readable {
+
+  constructor(catalogSize, createdAt, chunkSize = 1000) {
+    super({ objectMode: true });
+
+    this.catalogSize = catalogSize;
+    this.createdAt = createdAt;
+    this.chunkSize = chunkSize;
+    this.index = 0;
+  }
+
+  _read() {
+    if (this.index < this.catalogSize) {
+      const size = Math.min(this.chunkSize, this.catalogSize - this.index);
+      const chunk = Array.from({ length: size }, () => generateProduct(this.index, this.createdAt));
+      this.index += size;
+      this.push(chunk);
+    } else {
+      this.push(null); // Signal end of stream
+    }
+  }
 }
 
 function logProgress(numerator, denominator) {
@@ -93,13 +110,13 @@ function generatePrice() {
 }
 
 const productEvent = {
-  pDelete: 10,// probability of deleting the product
-  pUpdate: 10,// probability of updating the product
-  pAdd: 20,// probability of adding a new product
+  pDelete: 10, // probability of deleting the product
+  pUpdate: 10, // probability of updating the product
+  pAdd: 20, // probability of adding a new product
 };
 
 function generateUpdate(product, index, catalogSize) {
-  const rand = Math.random() * 100;// float in [0; 100]
+  const rand = Math.random() * 100; // float in [0; 100]
   if (rand < productEvent.pDelete) { // [0; pDelete[
     // Delete product
     return null;
