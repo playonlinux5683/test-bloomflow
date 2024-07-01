@@ -1,5 +1,7 @@
 const fs = require('fs');
 const { MongoClient } = require('mongodb');
+const csv = require('csv-parser');
+const _ = require('lodash');
 const Promise = require('bluebird');
 
 const { memory } = require('./helpers/memory');
@@ -7,11 +9,12 @@ const { timing } = require('./helpers/timing');
 const { Metrics } = require('./helpers/metrics');
 const { Product } = require('./product');
 
-const _ = require('lodash');
-const { Readable } = require('stream');
+const { DeleteReadableStream, DeleteWritableStream } = require('./deletion-streams');
 
 const MONGO_URL = 'mongodb://localhost:27017/test-product-catalog';
 const catalogUpdateFile = 'updated-catalog.csv';
+const CHUNK_SIZE = 1000;
+
 
 async function main() {
   const mongoClient = new MongoClient(MONGO_URL);
@@ -24,29 +27,7 @@ async function main() {
       () => updateDataset(db)));
 }
 
-
-function arrayToStream(array, chunkSize) {
-  let index = 0;
-
-  return new Readable({
-    objectMode: true,
-    read() {
-      if (index < array.length) {
-        const chunk = array.slice(index, index + chunkSize);
-        index += chunkSize;
-        this.push(chunk);
-      } else {
-        this.push(null); // Signal end of stream
-      }
-    }
-  });
-}
-
 async function updateDataset(db) {
-  const csvContent = fs.readFileSync(catalogUpdateFile, 'utf-8');
-  const rowsWithHeader = csvContent.split('\n');
-  const dataRows = rowsWithHeader.slice(1);// skip headers
-
   const metrics = Metrics.zero();
   function updateMetrics(updateResult) {
     if (updateResult.modifiedCount) {
@@ -60,36 +41,68 @@ async function updateDataset(db) {
   const dbCatalogSize = await db.collection('Products').count();
   const closestPowOf10 = 10 ** (Math.ceil(Math.log10(dbCatalogSize)));
   function logProgress(nbCsvRows) {
-    const progressIndicator = nbCsvRows * 100 / closestPowOf10;
+    const progressIndicator = Math.round(nbCsvRows * 100 / closestPowOf10);
     if (progressIndicator % 10 === 0) {
       console.debug(`[DEBUG] Processed ${nbCsvRows} rows...`);
     }
   }
 
-  const allProducts = dataRows.filter(dataRow => dataRow).map(row => Product.fromCsv(row));
-  const stream = arrayToStream(allProducts, 1000);
-  let index = 0;
-  for await (const products of stream) {
-    await Promise.map(products, async (product) => {
-      const updateResult = await db.collection('Products')
-        .updateOne(
-          { _id: product._id },
-          { $set: product },
-          { upsert: true });
+  let products = [];
+  let rowCount = 0;
+
+  const processChunk = async (chunk) => {
+    const bulkOps = chunk.map(product => ({
+      updateOne: {
+        filter: { _id: product._id },
+        update: { $set: product },
+        upsert: true
+      }
+    }));
+    if (bulkOps.length > 0) {
+      const updateResult = await db.collection('Products').bulkWrite(bulkOps);
       updateMetrics(updateResult);
-      logProgress(++index);
+      logProgress(rowCount);
+    }
+  };
+
+  const dbIds = (await db.collection('Products').find({}, { projection: { _id: 1 } }).toArray()).map(o => o._id);
+
+  const csvStream = fs.createReadStream(catalogUpdateFile)
+    .pipe(csv())
+    .on('data', async (row) => {
+      const product = Product.fromCsv(Object.values(row).join(','));
+      products.push(product);
+      rowCount++;
+
+      if (products.length === CHUNK_SIZE) {
+        await processChunk(products);
+        products = [];
+      }
+    })
+    .on('end', async () => {
+      if (products.length > 0) {
+        await processChunk(products);
+      }
+
+      const productIds = products.map(p => p._id);
+      const deletedProductIds = _.difference(dbIds, productIds);
+      const readable = new DeleteReadableStream(deletedProductIds);
+
+      const deleteStream = new DeleteWritableStream(db, metrics);
+      deleteStream.on('finish', () => {
+        logMetrics(rowCount, metrics);
+      });
+
+      readable.pipe(deleteStream);
+    })
+    .on('error', (error) => {
+      console.error(error);
     });
-  }
 
-  const dbIds = (await db.collection('Products').find({}, { _id: 1 }).toArray()).map(o => o._id);
-  const productIds = allProducts.map(product => product._id);
-  const deletedProductIds = _.difference(dbIds, productIds);
-  for await (const productIds of arrayToStream(deletedProductIds, 1000)) {
-    const deletionResult = await db.collection('Products').deleteMany({ _id: { $in: productIds } });
-    metrics.deletedCount += deletionResult.deletedCount;
-
-  }
-  logMetrics(dataRows.length - 1, metrics); // dataRows.length-1 because there is a new line at the end of file.
+  return new Promise((resolve, reject) => {
+    csvStream.on('end', resolve);
+    csvStream.on('error', reject);
+  });
 }
 
 function logMetrics(numberOfProcessedRows, metrics) {
